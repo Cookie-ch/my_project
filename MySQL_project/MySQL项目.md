@@ -415,7 +415,6 @@ connect_timeout = 2
 
 ```
 service mysqlrouter restart
-systemctl enable mysqlrouter
 ```
 
 #### 4、查看监听端口
