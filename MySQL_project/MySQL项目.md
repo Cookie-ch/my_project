@@ -565,5 +565,98 @@ vrrp_instance VI_2 {
 }
 ```
 
+### 十一、性能测试
 
+#### 1、在客户机上安装sysbench
 
+```
+yum install epel-release -y
+yum install sysbench -y
+```
+
+#### 2、在master上建一个库供测试使用
+
+```
+mysql>create database test_db;
+```
+
+#### 3、在客户机上构造测试表和测试数据
+
+性能测试的准备阶段，确保在压力测试期间使用的测试数据是合适的，能够充分模拟真实的数据库负载
+
+```
+sysbench --db-driver=mysql --time=300 \
+--threads=10 --report-interval=1 \
+--mysql-host=192.168.232.188 --mysql-port=7002 \
+--mysql-user=chen-w --mysql-password=Chen123# \
+--mysql-db=test_db --tables=10 --table_size=1000 \
+oltp_read_write prepare
+```
+
+`--db-driver=mysql`：指定使用 MySQL 数据库驱动
+`--time=300`：设置测试持续时间为300 秒，即测试将会在 300秒内进行
+`--threads=10`：启动 100 个线程模拟并发访问，同时进行读写操作
+`--report-interval=1`：设置每隔 1 秒输出一次测试进度报告，0表示仅输出最终报告结果，默认为0
+`--mysql-host=192.168.232.188 --mysql-port=7002 --mysql-user=chen-w --mysql-password=Chen123# --mysql-db=test_db`：表示连接数据库的信息，这里连接的是router机器配置的vip和端口
+`--tables=10 --table_size=1000`：在测试库中构造10个测试表，每个测试表中包含 1000 条测试数据，测试数据太大可能会导致mysql集群的磁盘耗尽，集群崩盘
+`oltp_read_write`：测试模型，表示进行读写测试
+`prepare`：表示进行准备阶段，创建测试用的表，并填充测试数据
+![image-20230819114317954](MySQL项目.assets/image-20230819114317954.png)
+
+#### 4、测试数据库读写性能
+
+使用并发的线程模拟数据库的读写操作，以测试数据库在高并发负载下的性能表现。压力测试会持续 300 秒，在测试过程中，会输出一些统计信息，如每秒事务数、每秒查询数、延迟等，以便分析数据库的性能状况
+
+```
+sysbench --db-driver=mysql --time=300 \
+--threads=10 --report-interval=1 \
+--mysql-host=192.168.232.188 --mysql-port=7002 \
+--mysql-user=chen-w --mysql-password=Chen123# \
+--mysql-db=test_db --tables=10 --table_size=1000 \
+oltp_read_write run
+```
+
+`run`：表示运行阶段，即进行压力测试
+
+每秒的测试结果：
+![image-20230819114417848](MySQL项目.assets/image-20230819114417848.png)
+
+测试结果参数说明：
+
+`thds： 10`：表示有10个线程在进行压力测试
+`tps`：表示每秒执行了多少个事务（读写操作）
+`qps`：表示每秒执行了多少个查询
+`(r/w/o: 2940.31/822.85/417.91)`：每秒有2940.31个读操作，822.85个写操作，417.91个其他操作
+`lat (ms,95%): 70.55`：表示95%的请求延迟都在70.55毫秒以下
+`err/s: 0.00 reconn/s`: 0.00：表示每秒有0请求失败，发生0次网络重连
+
+__总测试结果：__
+
+```
+sysbench --db-driver=mysql --time=60 --threads=10 \
+--mysql-host=192.168.232.188 --mysql-port=7002 \
+--mysql-user=chen-w --mysql-password=Chen123# \
+--mysql-db=test_db --tables=10 --table_size=1000 \
+oltp_read_write run
+```
+
+![image-20230819114714724](MySQL项目.assets/image-20230819114714724.png)
+
+测试结果分析： 
+SQL statistics 部分提供了执行的查询数量和事务数量等信息
+General statistics 部分提供了总的测试时间和事件数量，一共执行了13635次，实际执行时间为60.0794s
+Latency (ms) 部分显示了请求的延迟统计，包括最小、平均、最大延迟以及95% 响应时间等
+Threads fairness 部分提供了事件和执行时间的平均值和标准差
+
+#### 5、压力测试完成后，清除数据
+
+```
+sysbench --db-driver=mysql --time=300 \
+--threads=10 --report-interval=1 \
+--mysql-host=192.168.232.188 --mysql-port=7002 \
+--mysql-user=chen-w --mysql-password=Chen123# \
+--mysql-db=test_db --tables=10 --table_size=1000 \
+oltp_read_write cleanup
+```
+
+### 
