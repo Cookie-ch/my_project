@@ -954,7 +954,7 @@ ifconfig ens33:1 192.168.232.10/24
 ip add
 ```
 
-#### 8、测试
+#### 9、测试
 
 manager节点上测试ssh免密通道，如果正常最后会输出successfully
 
@@ -972,7 +972,7 @@ masterha_check_repl -conf=/etc/masterha/app1.cnf
 
 ![image-20230821214352266](MySQL项目.assets/image-20230821214352266-16926265582562.png)
 
-#### 9、manager节点后台开启MHA
+#### 10、manager节点后台开启MHA
 
 ```
 mkdir -p /var/log/masterha/app1/
@@ -995,7 +995,7 @@ cat /var/log/masterha/app1/manager.log | grep "current master"
 
 ![image-20230821214530148](MySQL项目.assets/image-20230821214530148-16926255308591-16926265582574.png)
 
-#### 10、故障转移效果测试，模拟matser宕机，指定slave1成为新的master
+#### 11、故障转移效果测试，模拟matser宕机，指定slave1成为新的master
 
 manager节点监控日志记录（实时监控）
 
@@ -1015,7 +1015,7 @@ service mysqld stop
 在slave2上看master_info的信息，主已经是slave1了
 ![image-20230821214829336](MySQL项目.assets/image-20230821214829336-16926265582575.png)
 
-#### 11、故障修复
+#### 12、故障修复
 
 **如果原master服务器已经可以重新启动，将他变为slave服务器，主为slave1**
 
