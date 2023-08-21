@@ -659,4 +659,421 @@ sysbench --db-driver=mysql --time=300 \
 oltp_read_write cleanup
 ```
 
-### 
+### 十二、使用MHA实现自动故障切换
+
+MHA（Master High Availability）是一个用于管理 MySQL 主从复制集群的工具，旨在提供高可用性和自动故障切换的解决方案。它的主要功能是监控主服务器（主节点）和备服务器（从节点）的状态，以便在主节点发生故障时自动进行故障切换，将备节点提升为新的主节点，从而实现数据库的高可用性。
+
+#### 1、在ansible上编写主机清单
+
+```
+vim /etc/ansible/hosts
+
+[mha_manager]
+192.168.232.144
+[mha_node]
+192.168.232.147
+192.168.232.141
+192.168.232.148
+```
+
+#### 2、编写node和manager的安装脚本
+
+一键安装mha node脚本
+
+```
+[root@mha_manager ~]# cat onekey_install_mha_node.sh 
+#查看可以安装或者已安装的rpm包，并且作缓存
+yum list
+
+#下载epel源
+yum install epel-release --nogpgcheck -y
+
+#下载依赖包
+yum install -y perl-DBD-MySQL \
+perl-Config-Tiny \
+perl-Log-Dispatch \
+perl-Parallel-ForkManager \
+perl-ExtUtils-CBuilder \
+perl-ExtUtils-MakeMaker \
+perl-CPAN
+ 
+#软件包mha4mysql-node-0.58.tar.gz已经放入/root目录下，将其解压
+cd ~
+tar zxvf mha4mysql-node-0.58.tar.gz
+cd mha4mysql-node-0.58
+ 
+#编译安装
+perl Makefile.PL
+make && make install
+```
+
+mha manager安装脚本
+
+```
+#软件包mha4mysql-manager-0.58.tar.gz放入/root目录下
+cd ~
+tar zxvf mha4mysql-manager-0.58.tar.gz
+cd mha4mysql-manager-0.58
+ 
+#编译安装
+perl Makefile.PL
+make && make install
+```
+
+#### 3、编写playbook远程安装MHA
+
+playbook内容：上传源码包到家目录下，调用本地脚本，远程安装部署mha相关软件环境
+
+```
+vim mha_install.yaml
+
+- hosts: mha_node
+  remote_user: root
+  tasks: 
+  - name: copy file
+    copy: src=/root/mha4mysql-node-0.58.tar.gz dest=/root/
+  - name: install mha_node
+    script: /root/onekey_install_mha_node.sh
+- hosts: mha_manager
+  remote_user: root
+  tasks:
+  - name: copy file
+    copy: src=/root/mha4mysql-manager-0.58.tar.gz dest=/root/
+  - name: install mha_manager
+    script: /root/onekey_install_mha_manager.sh 
+```
+
+执行playbook
+
+```
+ansible-playbook mha_install.yaml
+```
+
+#### 4、所有服务器之间建立免密通道
+
+```
+ssh-keygen
+ssh-copy-id -i /root/.ssh/id_rsa.pub (其他主机IP)
+```
+
+#### 5、在Mysql的主从复制服务器里，配置MHA相关信息
+
+所有mysql服务器（master、slave1、slave2）将mysql命令和mysqlbinlog二进制文件操作命令软链接到/usr/sbin，方便manager管理节点，因为/usr/sbin/ 目录下可以被直接调用
+
+```
+ln -s /usr/local/mysql/bin/mysql /usr/sbin/
+ln -s /usr/local/mysql/bin/mysqlbinlog /usr/sbin/
+```
+
+#### 6、所有mysql服务器新建允许manager访问的授权用户mha，密码123456
+
+```
+mysql>grant all on *.* to 'mha'@'192.168.232.%' identified by '123456';
+mysql>grant all on *.* to 'mha'@'192.168.2.147' identified by '123456';
+mysql>grant all on *.* to 'mha'@'192.168.2.141' identified by '123456';
+mysql>grant all on *.* to 'mha'@'192.168.2.148' identified by '123456';
+
+mysql>select user,host from mysql.user;
+```
+
+#### 7、在MHA manager节点上配置好相关脚本、管理节点服务器
+
+mha manager节点上复制相关脚本到/usr/local/bin下
+
+```
+cp -rp /root/mha4mysql-manager-0.58/samples/scripts/ /usr/local/bin/
+cd /root/mha4mysql-manager-0.58/samples/scripts
+ls
+
+master_ip_failover  master_ip_online_change  power_manager  send_report
+```
+
+复制自动切换时vip管理的脚本到/usr/local/bin下
+
+```
+cp /usr/local/bin/scripts/master_ip_failover /usr/local/bin/
+ls
+
+master_ip_failover  master_ip_online_change  power_manager  send_report
+```
+
+修改master_ip_failover文件内容，配置vip(192.168.232.10)
+
+**注意：注释只是提示用，编辑配置文件时最好不要加注释，否则很可能会出错**
+
+```
+cd /usr/local/bin/
+>/usr/local/bin/master_ip_failover  #清空文件内容，复制以下内容
+vim master_ip_failover 
+
+#!/usr/bin/env perl
+use strict;
+use warnings FATAL => 'all';
+ 
+use Getopt::Long;
+ 
+my (
+$command, $ssh_user, $orig_master_host, $orig_master_ip,
+$orig_master_port, $new_master_host, $new_master_ip, $new_master_port
+);
+
+my $vip = '192.168.232.10';								#指定vip的地址，自己指定
+my $brdc = '192.168.232.255';								#指定vip的广播地址
+my $ifdev = 'ens33';										#指定vip绑定的网卡
+my $key = '1';												#指定vip绑定的虚拟网卡序列号
+my $ssh_start_vip = "/sbin/ifconfig ens33:$key $vip";		#代表此变量值为ifconfig ens33:1 192.168.232.10
+my $ssh_stop_vip = "/sbin/ifconfig ens33:$key down";		#代表此变量值为ifconfig ens33:1 192.168.232.10 down
+my $exit_code = 0;											#指定退出状态码为0
+#my $ssh_start_vip = "/usr/sbin/ip addr add $vip/24 brd $brdc dev $ifdev label $ifdev:$key;/usr/sbin/arping -q -A -c 1 -I $ifdev $vip;iptables -F;";
+#my $ssh_stop_vip = "/usr/sbin/ip addr del $vip/24 dev $ifdev label $ifdev:$key";
+
+GetOptions(
+'command=s' => \$command,
+'ssh_user=s' => \$ssh_user,
+'orig_master_host=s' => \$orig_master_host,
+'orig_master_ip=s' => \$orig_master_ip,
+'orig_master_port=i' => \$orig_master_port,
+'new_master_host=s' => \$new_master_host,
+'new_master_ip=s' => \$new_master_ip,
+'new_master_port=i' => \$new_master_port,
+);
+ 
+exit &main();
+ 
+sub main {
+ 
+print "\n\nIN SCRIPT TEST====$ssh_stop_vip==$ssh_start_vip===\n\n";
+ 
+if ( $command eq "stop" || $command eq "stopssh" ) {
+ 
+my $exit_code = 1;
+eval {
+print "Disabling the VIP on old master: $orig_master_host \n";
+&stop_vip();
+$exit_code = 0;
+};
+if ($@) {
+warn "Got Error: $@\n";
+exit $exit_code;
+}
+exit $exit_code;
+}
+elsif ( $command eq "start" ) {
+ 
+my $exit_code = 10;
+eval {
+print "Enabling the VIP - $vip on the new master - $new_master_host \n";
+&start_vip();
+$exit_code = 0;
+};
+if ($@) {
+warn $@;
+exit $exit_code;
+}
+exit $exit_code;
+}
+elsif ( $command eq "status" ) {
+print "Checking the Status of the script.. OK \n";
+exit 0;
+}
+else {
+&usage();
+exit 1;
+}
+}
+sub start_vip() {
+`ssh $ssh_user\@$new_master_host \" $ssh_start_vip \"`;
+}
+## A simple system call that disable the VIP on the old_master
+sub stop_vip() {
+`ssh $ssh_user\@$orig_master_host \" $ssh_stop_vip \"`;
+}
+ 
+sub usage {
+print
+"Usage: master_ip_failover --command=start|stop|stopssh|status --orig_master_host=host --orig_master_ip=ip --orig_master_port=port --new_master_host=host --new_master_ip=ip --new_master_port=port\n";
+}
+
+```
+
+#### 8、创建 MHA 软件目录并复制配置文件
+
+使用app1.cnf配置文件来管理 mysql 节点服务器，配置文件一般放在/etc/目录下
+
+```
+cd /usr/local/bin/
+mkdir /etc/masterha
+cp /root/mha4mysql-manager-0.58/samples/conf/app1.cnf /etc/masterha/
+cd /etc/masterha/
+>app1.cnf #清空原有内容
+vim app1.cnf 
+ 
+[server default]
+manager_log=/var/log/masterha/app1/manager.log　　　　　  #manager日志
+manager_workdir=/var/log/masterha/app1.log　　　　		#manager工作目录
+master_binlog_dir=/data/mysql/　　　　　　　　 　#master保存binlog的位置，这里的路径要与master里配置的binlog的路径一致，以便MHA能找到
+master_ip_failover_script=/usr/local/bin/master_ip_failover　          　#设置自动failover时候的切换脚本，也就是上面的那个脚本
+master_ip_online_change_script=/usr/local/bin/master_ip_online_change　　#设置手动切换时候的切换脚本
+user=mha					#设置监控用户mha
+password=123456			#设置mysql中mha用户的密码，这个密码是前文中创建监控用户的那个密码
+ping_interval=1				#设置监控主库，发送ping包的时间间隔1秒，默认是3秒，尝试三次没有回应的时候自动进行failover
+remote_workdir=/tmp			#设置远端mysql在发生切换时binlog的保存位置
+repl_user=chen			#设置复制用户的用户
+repl_password=Chen123#		#设置复制用户的密码
+report_script=/usr/local/send_report　　　　　#设置发生切换后发送的报警的脚本
+secondary_check_script=/usr/local/bin/masterha_secondary_check -s 192.168.2.141 -s 192.168.2.148	#指定检查的从服务器IP地址
+shutdown_script=""			#设置故障发生后关闭故障主机脚本（该脚本的主要作用是关闭主机防止发生脑裂,这里没有使用）
+ssh_user=root				#设置ssh的登录用户名
+ 
+[server1]
+#master
+hostname=192.168.232.147 
+port=3306
+ 
+[server2]
+#slave1
+hostname=192.168.232.141
+port=3306
+candidate_master=1
+#设置为候选master，设置该参数以后，发生主从切换以后将会将此从库提升为主库，即使这个主库不是集群中最新的slave
+ 
+check_repl_delay=0
+#默认情况下如果一个slave落后master 超过100M的relay logs的话，MHA将不会选择该slave作为一个新的master， 因为对于这个slave的恢复需要花费很长时间；通过设置check_repl_delay=0，MHA触发切换在选择一个新的master的时候将会忽略复制延时，这个参数对于设置了candidate_master=1的主机非常有用，因为这个候选主在切换的过程中一定是新的master
+ 
+[server3]
+#slave2
+hostname=192.168.232.148
+port=3306
+```
+
+master服务器上手工开启vip
+
+```
+cd
+ifconfig ens33:1 192.168.232.10/24
+ip add
+```
+
+#### 8、测试
+
+manager节点上测试ssh免密通道，如果正常最后会输出successfully
+
+```
+masterha_check_ssh -conf=/etc/masterha/app1.cnf
+```
+
+![image-20230821214311545](MySQL项目.assets/image-20230821214311545-16926265582561.png)
+
+manager节点上测试mysql主从连接情况
+
+```
+masterha_check_repl -conf=/etc/masterha/app1.cnf
+```
+
+![image-20230821214352266](MySQL项目.assets/image-20230821214352266-16926265582562.png)
+
+#### 9、manager节点后台开启MHA
+
+```
+mkdir -p /var/log/masterha/app1/
+nohup masterha_manager --conf=/etc/masterha/app1.cnf --remove_dead_master_conf --ignore_last_failover < /dev/null > /var/log/masterha/app1/manager.log 2>&1 &
+```
+
+查看 MHA 状态，可以看到当前的 master 是 Mysql1 节点
+
+```
+masterha_check_status --conf=/etc/masterha/app1.cnf
+```
+
+![image-20230821214509519](MySQL项目.assets/image-20230821214509519-16926265582573.png)
+
+查看MHA日志，看到当前matser是192.168.2.150
+
+```
+cat /var/log/masterha/app1/manager.log | grep "current master"
+```
+
+![image-20230821214530148](MySQL项目.assets/image-20230821214530148-16926255308591-16926265582574.png)
+
+#### 10、故障转移效果测试，模拟matser宕机，指定slave1成为新的master
+
+manager节点监控日志记录（实时监控）
+
+```
+tail -f /var/log/masterha/app1/manager.log
+```
+
+模拟master宕机，停掉master
+
+```
+service mysqld stop
+```
+
+这个时候看到vip已经飘移到slave1上了
+![image-20230821214704730](MySQL项目.assets/image-20230821214704730-16926256441873-16926265582576.png)
+
+在slave2上看master_info的信息，主已经是slave1了
+![image-20230821214829336](MySQL项目.assets/image-20230821214829336-16926265582575.png)
+
+#### 11、故障修复
+
+**如果原master服务器已经可以重新启动，将他变为slave服务器，主为slave1**
+
+原master开启mysqld服务
+
+```
+service mysqld start
+```
+
+修复主从，原master修改master_info指向新的master（原slave1）
+
+在master上进行操作
+
+```
+mysql>change master to master_host='192.168.232.141',master_user='chen',master_password='Chen123#',master_port=3306,master_auto_position=1;
+mysql>start slave;
+mysql>show slave status\G;
+```
+
+在 manager 节点上修改配置文件/etc/masterha/app1.cnf（再把这个记录添加进去，因为master宕机后原来的server1会被自动删除）
+
+```
+[server default]
+manager_log=/var/log/masterha/app1/manager.log
+manager_workdir=/var/log/masterha/app1
+master_binlog_dir=/data/mysql/
+master_ip_failover_script=/usr/local/bin/master_ip_failover
+master_ip_online_change_script=/usr/local/bin/master_ip_online_change
+password=123456
+ping_interval=1
+remote_workdir=/tmp
+repl_password=Chen123#
+repl_user=chen
+secondary_check_script=/usr/local/bin/masterha_secondary_check -s 192.168.232.141 -s 192.168.232.148
+shutdown_script=""
+ssh_user=root
+user=mha
+ 
+[server1]
+hostname=192.168.232.141   #原slave1的IP地址
+port=3306
+ 
+[server2]
+candidate_master=1
+check_repl_delay=0
+hostname=192.168.232.147   #原master的IP地址
+port=3306
+ 
+[server3]
+hostname=192.168.232.148   #原slave2的IP地址
+port=3306 
+```
+
+重启MHA manager，检查此时的master
+
+```
+masterha_stop --conf=/etc/masterha/app1.cnf
+nohup masterha_manager --conf=/etc/masterha/app1.cnf --remove_dead_master_conf --ignore_last_failover < /dev/null > /var/log/masterha/app1/manager.log 2>&1 &
+masterha_check_status --conf=/etc/masterha/app1.cnf
+```
+
